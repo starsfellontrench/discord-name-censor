@@ -1,4 +1,4 @@
-const SHELL = 'censor-shell-v1';
+const SHELL = 'censor-shell-v2';
 const SHELL_FILES = ['/', '/manifest.webmanifest', '/icon.svg', '/icon-192.png', '/icon-512.png'];
 
 self.addEventListener('install', e => {
