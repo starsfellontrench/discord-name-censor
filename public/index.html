@@ -9,7 +9,7 @@
 <link rel="apple-touch-icon" href="/icon-192.png">
 <link rel="manifest" href="/manifest.webmanifest">
 <meta name="theme-color" content="#e56aa5">
-<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js" integrity="sha512-XMVd28F1oH/O71fzwBnV7HucLxVwtxf26XV8P4wPk26EDxuGZ91N8bsOttmnomcCD3CS5ZMRL50H0GgOHvegtg==" crossorigin="anonymous" defer></script>
 <style>
 :root{
   color-scheme:light;
@@ -444,17 +444,35 @@ const STORE = { legacy: 'namecensor.samples.v1', data: 'namecensor.data.v2', loo
 const SCALED_SLACK = 0.03;
 const NAME_FONT = '"gg sans","Noto Sans","Segoe UI",Helvetica,Arial,sans-serif';
 const TESSERACT_URL = 'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js';
+const TESSERACT_SRI = 'sha384-GJqSu7vueQ9qN0E9yLPb3Wtpd7OrgK8KmYzC8T1IysG1bcvxvIO4qtYR/D3A991F';
 
 const workerUrl = URL.createObjectURL(new Blob([$('workerSrc').textContent], { type: 'text/javascript' }));
-const POOL = Array.from({ length: Math.min(4, Math.max(1, (navigator.hardwareConcurrency || 2) - 1)) }, () => {
+const POOL = [];
+const pendingJobs = () => POOL.reduce((n, w) => n + (w.jobs || 0), 0);
+function makeWorker(slot) {
   const w = new Worker(workerUrl);
-  w.onmessage = onResult;
-  w.onerror = e => toast('matching broke: ' + e.message, 4000);
+  POOL[slot] = w;
+  w.onmessage = e => { w.ok = true; onResult(e, w); };
+  w.onerror = e => {
+    toast('matching broke: ' + e.message, 4000);
+    w.jobs = 0;
+    if (w.ok) {
+      makeWorker(slot);
+      for (const im of S.images) {
+        if (im.worker !== w) continue;
+        im.worker = POOL[slot];
+        sendImage(im);
+        for (const s of S.samples) if (im.results.get(s.id) === null) runMatch(im, s);
+      }
+    }
+    if (!pendingJobs()) S.waiters.splice(0).forEach(r => r());
+  };
   return w;
-});
+}
+for (let i = 0, n = Math.min(4, Math.max(1, (navigator.hardwareConcurrency || 2) - 1)); i < n; i++) makeWorker(i);
 
 const S = { images: [], cur: null, samples: [], people: [], active: null, mode: 'match', zoom: 'fit', peek: false,
-  undo: [], drag: null, pending: 0, waiters: [], focus: -1, hintsOff: false };
+  undo: [], drag: null, waiters: [], focus: -1, hintsOff: false };
 S.hintsOff = !!storeGet(STORE.hints);
 let nextId = 1;
 const uid = () => nextId++;
@@ -505,19 +523,23 @@ function removePerson(p) {
 
 async function decode(file) {
   const url = URL.createObjectURL(file);
-  const el = new Image();
-  el.src = url;
-  await el.decode();
-  const w = el.naturalWidth, h = el.naturalHeight;
-  const c = document.createElement('canvas'); c.width = w; c.height = h;
-  const ctx = c.getContext('2d', { willReadFrequently: true });
-  ctx.drawImage(el, 0, 0);
-  const id = uid(), worker = POOL[id % POOL.length];
-  const data = ctx.getImageData(0, 0, w, h).data;
-  worker.postMessage({ type: 'image', id, data, w, h }, [data.buffer]);
-  const named = file.name && file.name !== 'image.png';
-  const stem = named ? file.name.replace(/\.[^.]+$/, '') : `screenshot-${S.images.length + 1}`;
-  return { id, stem, el, url, w, h, ctx, worker, results: new Map(), off: new Set(), boxes: [], crop: null, cache: new Map() };
+  try {
+    const el = new Image();
+    el.src = url;
+    await el.decode();
+    const w = el.naturalWidth, h = el.naturalHeight;
+    const c = document.createElement('canvas'); c.width = w; c.height = h;
+    const ctx = c.getContext('2d', { willReadFrequently: true });
+    ctx.drawImage(el, 0, 0);
+    const id = uid(), named = file.name && file.name !== 'image.png';
+    const stem = named ? file.name.replace(/\.[^.]+$/, '') : `screenshot-${S.images.length + 1}`;
+    const im = { id, stem, el, url, file, w, h, ctx, worker: POOL[id % POOL.length], results: new Map(), off: new Set(), boxes: [], crop: null, cache: new Map() };
+    sendImage(im);
+    return im;
+  } catch (err) {
+    URL.revokeObjectURL(url);
+    throw err;
+  }
 }
 
 async function addFiles(files) {
@@ -540,9 +562,16 @@ function removeImage(im) {
   const i = S.images.indexOf(im);
   if (i < 0) return;
   S.images.splice(i, 1);
+  im.worker.postMessage({ type: 'drop', id: im.id });
+  URL.revokeObjectURL(im.url);
   const wasCur = S.cur === im;
   if (wasCur) { S.cur = S.images[Math.min(i, S.images.length - 1)] || null; S.focus = -1; }
-  pushUndo({ undo: () => { S.images.splice(Math.min(i, S.images.length), 0, im); if (wasCur || !S.cur) select(im); } });
+  pushUndo({ undo: () => {
+    S.images.splice(Math.min(i, S.images.length), 0, im);
+    im.url = URL.createObjectURL(im.file);
+    sendImage(im);
+    if (wasCur || !S.cur) select(im);
+  } });
   renderAll();
   toast('removed');
 }
@@ -554,10 +583,15 @@ function select(im) {
   document.querySelector(`.tile[data-id="${im.id}"]`)?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
 }
 
+function sendImage(im) {
+  const data = im.ctx.getImageData(0, 0, im.w, im.h).data;
+  im.worker.postMessage({ type: 'image', id: im.id, data, w: im.w, h: im.h }, [data.buffer]);
+}
+
 function runMatch(im, s) {
   if (s.w > im.w || s.h > im.h) { im.results.set(s.id, []); return; }
   im.results.set(s.id, null);
-  S.pending++;
+  im.worker.jobs = (im.worker.jobs || 0) + 1;
   const origin = s.origin && s.origin.imageId === im.id ? { x: s.origin.x, y: s.origin.y } : null;
   im.worker.postMessage({ type: 'match', imageId: im.id, sampleId: s.id, tpl: s.data, tw: s.w, th: s.h, origin, scales: $('scales').checked });
   showProgress();
@@ -568,9 +602,9 @@ function rematchAll() {
   renderAll();
 }
 
-function onResult(e) {
+function onResult(e, w) {
   const { imageId, sampleId, matches, error } = e.data;
-  S.pending--;
+  w.jobs = Math.max(0, (w.jobs || 0) - 1);
   if (error) toast('matching failed on one screenshot: ' + error, 4000);
   const im = S.images.find(i => i.id === imageId);
   if (im && S.samples.some(s => s.id === sampleId) && im.results.has(sampleId)) {
@@ -579,13 +613,14 @@ function onResult(e) {
   }
   renderCounts();
   showProgress();
-  if (!S.pending) S.waiters.splice(0).forEach(r => r());
+  if (!pendingJobs()) S.waiters.splice(0).forEach(r => r());
 }
 
-function idle() { return S.pending ? new Promise(r => S.waiters.push(r)) : Promise.resolve(); }
+function idle() { return pendingJobs() ? new Promise(r => S.waiters.push(r)) : Promise.resolve(); }
 
 function showProgress() {
-  if (S.pending) setStatus(`matching… ${S.pending} left`);
+  const n = pendingJobs();
+  if (n) setStatus(`matching… ${n} left`);
   else if ($('status').dataset.kind === 'progress') setStatus('');
 }
 
@@ -1212,7 +1247,7 @@ function saveBlob(blob, name) {
 }
 
 async function waitForMatches() {
-  if (!S.pending) return;
+  if (!pendingJobs()) return;
   setStatus('matching…', 'progress');
   await idle();
 }
@@ -1319,6 +1354,8 @@ function loadTesseract() {
     if (window.Tesseract) return resolve(window.Tesseract);
     const s = document.createElement('script');
     s.src = TESSERACT_URL;
+    s.integrity = TESSERACT_SRI;
+    s.crossOrigin = 'anonymous';
     s.onload = () => resolve(window.Tesseract);
     s.onerror = () => reject(new Error('could not load the text reader'));
     document.head.appendChild(s);
@@ -1342,7 +1379,8 @@ function editDistance(a, b) {
 const nameMatches = (word, target) => word === target || (target.length >= 4 && Math.abs(word.length - target.length) <= 1 && editDistance(word, target) <= 1);
 
 function ocrCanvas(im, f = 2) {
-  const c = document.createElement('canvas'); c.width = im.w * f; c.height = im.h * f;
+  f = Math.min(f, Math.sqrt(2 ** 24 / (im.w * im.h)));
+  const c = document.createElement('canvas'); c.width = Math.round(im.w * f); c.height = Math.round(im.h * f);
   const ctx = c.getContext('2d');
   ctx.imageSmoothingQuality = 'high';
   ctx.drawImage(im.el, 0, 0, c.width, c.height);
