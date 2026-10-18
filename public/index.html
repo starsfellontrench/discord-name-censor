@@ -457,6 +457,7 @@ function makeWorker(slot) {
     toast('matching broke: ' + e.message, 4000);
     w.jobs = 0;
     if (w.ok) {
+      w.terminate();
       makeWorker(slot);
       for (const im of S.images) {
         if (im.worker !== w) continue;
@@ -569,7 +570,9 @@ function removeImage(im) {
   pushUndo({ undo: () => {
     S.images.splice(Math.min(i, S.images.length), 0, im);
     im.url = URL.createObjectURL(im.file);
+    if (!POOL.includes(im.worker)) im.worker = POOL[im.id % POOL.length];
     sendImage(im);
+    for (const s of S.samples) if (!im.results.has(s.id) || im.results.get(s.id) === null) runMatch(im, s);
     if (wasCur || !S.cur) select(im);
   } });
   renderAll();
